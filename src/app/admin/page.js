@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { ShieldCheck, Plus, X, Sparkles, Receipt, CheckCircle, Lock } from 'lucide-react';
+import { ShieldCheck, Plus, X, Sparkles, Receipt, CheckCircle, Lock, ChevronLeft, ChevronRight, GripVertical } from 'lucide-react';
 import { doc, setDoc, deleteDoc, collection, onSnapshot } from 'firebase/firestore';
 import { signInWithEmailAndPassword, onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '@/lib/firebase';
@@ -30,6 +30,10 @@ export default function AdminPage() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [rawStickerText, setRawStickerText] = useState('');
   const [isStickerLoading, setIsStickerLoading] = useState(false);
+
+  // Drag and Drop State
+  const [draggedIdx, setDraggedIdx] = useState(null);
+  const [draggedCategory, setDraggedCategory] = useState(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, setUser);
@@ -177,6 +181,38 @@ export default function AdminPage() {
     setFormData(prev => ({ ...prev, photos: { ...prev.photos, [category]: [...(prev.photos?.[category] || []), ...newUrls] } }));
   };
 
+  // HTML5 Drag and Drop Handlers
+  const handleDragStart = (e, cat, idx) => {
+    setDraggedIdx(idx);
+    setDraggedCategory(cat);
+    e.dataTransfer.effectAllowed = 'move';
+  };
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+  };
+  const handleDrop = (e, cat, targetIdx) => {
+    e.preventDefault();
+    if (draggedCategory !== cat || draggedIdx === null || draggedIdx === targetIdx) return;
+    const newPhotos = [...formData.photos[cat]];
+    const [movedPhoto] = newPhotos.splice(draggedIdx, 1);
+    newPhotos.splice(targetIdx, 0, movedPhoto);
+    setFormData({ ...formData, photos: { ...formData.photos, [cat]: newPhotos } });
+    setDraggedIdx(null);
+    setDraggedCategory(null);
+  };
+
+  // Button Shift Handlers (for easy mobile reordering)
+  const shiftPhoto = (cat, idx, direction) => {
+    const newPhotos = [...formData.photos[cat]];
+    if (direction === -1 && idx > 0) {
+      [newPhotos[idx - 1], newPhotos[idx]] = [newPhotos[idx], newPhotos[idx - 1]];
+    } else if (direction === 1 && idx < newPhotos.length - 1) {
+       [newPhotos[idx + 1], newPhotos[idx]] = [newPhotos[idx], newPhotos[idx + 1]];
+    }
+    setFormData({ ...formData, photos: { ...formData.photos, [cat]: newPhotos } });
+  };
+
   if (!user) {
     return (
       <div className="min-h-screen bg-slate-100 flex flex-col">
@@ -270,11 +306,32 @@ export default function AdminPage() {
                         <input type="file" multiple accept="image/*" className="hidden" onChange={(e) => handleFileUpload(e, cat)} disabled={!formData.vin} />
                       </label>
                     </div>
-                    <div className="flex gap-2 overflow-x-auto pb-2">
+                    <div className="flex gap-2 overflow-x-auto pb-4 pt-2">
                       {formData.photos?.[cat]?.map((url, i) => (
-                        <div key={i} className="relative w-24 h-24 flex-shrink-0 rounded-lg overflow-hidden border border-slate-300 group">
-                          <img src={url} alt="" className="w-full h-full object-cover" />
-                          <button type="button" onClick={() => { const n = [...formData.photos[cat]]; n.splice(i,1); setFormData({...formData, photos: {...formData.photos, [cat]: n}}); }} className="absolute top-1 right-1 bg-red-500/90 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"><X size={12} /></button>
+                        <div 
+                          key={i} 
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, cat, i)}
+                          onDragOver={handleDragOver}
+                          onDrop={(e) => handleDrop(e, cat, i)}
+                          className={`relative w-28 h-28 flex-shrink-0 rounded-lg overflow-hidden border-2 transition-all cursor-grab active:cursor-grabbing group ${draggedIdx === i && draggedCategory === cat ? 'border-indigo-500 opacity-50' : 'border-slate-300 hover:border-slate-500'}`}
+                        >
+                          <img src={url} alt="" className="w-full h-full object-cover pointer-events-none" />
+                          
+                          {/* Image Hover/Touch Overlay */}
+                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-between p-1">
+                            {/* Reorder Buttons (Best for Mobile) */}
+                            <div className="flex justify-between items-center w-full mt-1 px-1">
+                              <button type="button" onClick={() => shiftPhoto(cat, i, -1)} disabled={i === 0} className="bg-white/20 text-white p-1 rounded hover:bg-white/40 disabled:opacity-30"><ChevronLeft size={16}/></button>
+                              <GripVertical size={16} className="text-white/80 cursor-move" />
+                              <button type="button" onClick={() => shiftPhoto(cat, i, 1)} disabled={i === formData.photos[cat].length - 1} className="bg-white/20 text-white p-1 rounded hover:bg-white/40 disabled:opacity-30"><ChevronRight size={16}/></button>
+                            </div>
+                            
+                            {/* Delete Button */}
+                            <div className="flex justify-center pb-1">
+                              <button type="button" onClick={() => { const n = [...formData.photos[cat]]; n.splice(i,1); setFormData({...formData, photos: {...formData.photos, [cat]: n}}); }} className="bg-red-500 text-white p-1.5 rounded-full hover:bg-red-600 shadow-sm transition-transform hover:scale-110"><X size={14} /></button>
+                            </div>
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -310,12 +367,12 @@ export default function AdminPage() {
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {vehicles.map(v => (
-                      <tr key={v.vin} className="hover:bg-slate-50">
+                      <tr key={v.vin} className="hover:bg-slate-50 transition-colors">
                         <td className="px-6 py-4 font-mono font-bold text-slate-800">{v.vin}</td>
                         <td className="px-6 py-4 font-medium text-slate-600">{v.year} {v.make} {v.model}</td>
                         <td className="px-6 py-4 flex justify-end space-x-4">
-                          <button onClick={() => handleEdit(v)} className="text-blue-600 hover:text-blue-800 font-bold text-sm">Edit</button>
-                          <button onClick={() => handleDelete(v.vin)} className="text-red-500 hover:text-red-700 font-bold text-sm">Delete</button>
+                          <button onClick={() => handleEdit(v)} className="text-blue-600 hover:text-blue-800 font-bold text-sm bg-blue-50 px-3 py-1 rounded-lg">Edit</button>
+                          <button onClick={() => handleDelete(v.vin)} className="text-red-500 hover:text-red-700 font-bold text-sm bg-red-50 px-3 py-1 rounded-lg">Delete</button>
                         </td>
                       </tr>
                     ))}
