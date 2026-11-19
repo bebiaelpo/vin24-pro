@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { ShieldCheck, Plus, X, Sparkles, Receipt, CheckCircle, Lock, ChevronLeft, ChevronRight, GripVertical } from 'lucide-react';
+import { useState, useEffect, useMemo } from 'react';
+import { ShieldCheck, Plus, X, Sparkles, Receipt, CheckCircle, Lock, ChevronLeft, ChevronRight, GripVertical, AlertCircle } from 'lucide-react';
 import { doc, setDoc, deleteDoc, collection, onSnapshot } from 'firebase/firestore';
 import { signInWithEmailAndPassword, onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '@/lib/firebase';
@@ -14,6 +14,45 @@ const safeStr = (val) => {
   return String(val);
 };
 
+const getJsonByteSize = (obj) => {
+  try {
+    return new Blob([JSON.stringify(obj)]).size;
+  } catch {
+    return JSON.stringify(obj).length;
+  }
+};
+
+const compressImageDataUrl = (src, maxSize = 480, quality = 0.4) => {
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.onerror = () => resolve(src);
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+      if (width > height) {
+        if (width > maxSize) {
+          height = Math.round(height * (maxSize / width));
+          width = maxSize;
+        }
+      } else {
+        if (height > maxSize) {
+          width = Math.round(width * (maxSize / height));
+          height = maxSize;
+        }
+      }
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/webp', quality));
+    };
+    img.src = src;
+  });
+};
+
 export default function AdminPage() {
   const [user, setUser] = useState(null);
   const [email, setEmail] = useState('');
@@ -24,12 +63,16 @@ export default function AdminPage() {
   // Dashboard Form State
   const [editingVin, setEditingVin] = useState(null);
   const [saveError, setSaveError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
   const [formData, setFormData] = useState({ vin: '', year: '', make: '', model: '', mileage: '', owners: '', engine: '', fuel: '', cylinders: '', options: '', condition: '', titleStatus: 'Clean Title', sellerName: '', sellerLocation: '', msrpStickerPdf: null, windowSticker: null, photos: { auction: [], shipment: [], container: [] } });
   
   const [rawAiText, setRawAiText] = useState('');
   const [isAiLoading, setIsAiLoading] = useState(false);
+  const [aiError, setAiError] = useState('');
+
   const [rawStickerText, setRawStickerText] = useState('');
   const [isStickerLoading, setIsStickerLoading] = useState(false);
+  const [stickerError, setStickerError] = useState('');
 
   // Drag and Drop State
   const [draggedIdx, setDraggedIdx] = useState(null);
@@ -50,6 +93,11 @@ export default function AdminPage() {
     return () => unsubscribe();
   }, [user]);
 
+  const docSizeKB = useMemo(() => {
+    if (!editingVin) return 0;
+    return Math.round(getJsonByteSize(formData) / 1024);
+  }, [formData, editingVin]);
+
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
@@ -60,7 +108,10 @@ export default function AdminPage() {
   };
 
   const handleEdit = (v) => { 
-    setEditingVin(v.vin); 
+    setEditingVin(v.vin);
+    setSaveError('');
+    setAiError('');
+    setStickerError('');
     const safePhotos = v.photos && typeof v.photos === 'object' && !Array.isArray(v.photos)
       ? { auction: [], shipment: [], container: [], ...v.photos }
       : { auction: [], shipment: [], container: [] };
@@ -68,7 +119,10 @@ export default function AdminPage() {
   };
   
   const handleNew = () => { 
-    setEditingVin('NEW'); 
+    setEditingVin('NEW');
+    setSaveError('');
+    setAiError('');
+    setStickerError('');
     setFormData({ vin: '', year: '', make: '', model: '', mileage: '', owners: '', engine: '', fuel: '', cylinders: '', options: '', condition: '', titleStatus: 'Clean Title', sellerName: '', sellerLocation: '', msrpStickerPdf: null, windowSticker: null, photos: { auction: [], shipment: [], container: [] } }); 
   };
   
@@ -81,25 +135,70 @@ export default function AdminPage() {
   const handleSave = async (e) => {
     e.preventDefault();
     setSaveError('');
+    setIsSaving(true);
     try {
       const vinUpper = safeStr(formData.vin).trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-      if(!vinUpper) { setSaveError("Valid VIN required."); return; }
+      if (!vinUpper) {
+        setSaveError("Valid VIN required.");
+        setIsSaving(false);
+        return;
+      }
+
+      let dataToSave = JSON.parse(JSON.stringify({ ...formData, vin: vinUpper }));
+      let byteSize = getJsonByteSize(dataToSave);
+
+      // If approaching Firestore's 1MB (1,048,576 bytes) limit, automatically run a tighter compression pass on photos
+      if (byteSize > 940000 && dataToSave.photos) {
+        const categories = ['auction', 'shipment', 'container'];
+        for (const cat of categories) {
+          if (Array.isArray(dataToSave.photos[cat]) && dataToSave.photos[cat].length > 0) {
+            dataToSave.photos[cat] = await Promise.all(
+              dataToSave.photos[cat].map((url) =>
+                typeof url === 'string' && url.startsWith('data:image')
+                  ? compressImageDataUrl(url, 380, 0.32)
+                  : url
+              )
+            );
+          }
+        }
+        setFormData(dataToSave);
+        byteSize = getJsonByteSize(dataToSave);
+      }
+
+      if (byteSize > 1000000) {
+        const pdfSizeKB = dataToSave.msrpStickerPdf ? Math.round(dataToSave.msrpStickerPdf.length / 1024) : 0;
+        setSaveError(
+          `Save failed: Total size is ${Math.round(byteSize / 1024)} KB (Firestore max is ~1000 KB). ` +
+          (pdfSizeKB > 300
+            ? `Your MSRP PDF alone is ${pdfSizeKB} KB—remove or compress the PDF, or remove a few photos.`
+            : `Remove a few photos to stay under 950 KB.`)
+        );
+        setIsSaving(false);
+        return;
+      }
+
       const docRef = doc(db, 'vehicles', vinUpper);
-      const safeData = JSON.parse(JSON.stringify({ ...formData, vin: vinUpper }));
-      await setDoc(docRef, safeData);
+      await setDoc(docRef, dataToSave);
       setEditingVin(null);
     } catch (err) { 
       if (err.message?.includes("size") || err.message?.includes("1048576")) {
-        setSaveError("Save failed. Firestore max document size (1MB) reached. Upload fewer photos.");
+        setSaveError("Save failed. Firestore max document size (1MB) reached. Remove a few photos or a large PDF.");
       } else {
         setSaveError(`Save failed: ${err.message}`);
       }
+    } finally {
+      setIsSaving(false);
     }
   };
 
   const handlePdfUpload = (e) => {
-    const file = e.target.files[0];
+    const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > 500 * 1024) {
+      setSaveError(`Warning: This PDF is ${Math.round(file.size / 1024)} KB. Firestore has a 1000 KB total limit per vehicle (including all photos), so a large PDF may prevent saving.`);
+    } else {
+      setSaveError('');
+    }
     const reader = new FileReader();
     reader.onload = (event) => setFormData(prev => ({ ...prev, msrpStickerPdf: event.target.result }));
     reader.readAsDataURL(file);
@@ -108,6 +207,7 @@ export default function AdminPage() {
   const handleAiParse = async () => {
     if (!rawAiText.trim()) return;
     setIsAiLoading(true);
+    setAiError('');
     try {
       const schema = { type: "OBJECT", properties: { vin: { type: "STRING" }, year: { type: "STRING" }, make: { type: "STRING" }, model: { type: "STRING" }, mileage: { type: "STRING" }, owners: { type: "STRING" }, engine: { type: "STRING" }, fuel: { type: "STRING" }, cylinders: { type: "STRING" }, options: { type: "STRING" }, condition: { type: "STRING" }, sellerName: { type: "STRING" }, sellerLocation: { type: "STRING" } } };
       const payload = {
@@ -121,14 +221,20 @@ export default function AdminPage() {
           const parsed = JSON.parse(jsonText.replace(/```json/g, '').replace(/```/g, ''));
           setFormData(prev => ({ ...prev, ...parsed }));
           setRawAiText('');
+      } else {
+          setAiError('Gemini returned an empty response. Please try again.');
       }
-    } catch (err) { console.error(err); }
+    } catch (err) {
+      console.error(err);
+      setAiError(err.message || 'Failed to parse auction data with Gemini.');
+    }
     setIsAiLoading(false);
   };
 
   const handleStickerParse = async () => {
     if (!rawStickerText.trim()) return;
     setIsStickerLoading(true);
+    setStickerError('');
     try {
       const schema = {
         type: "OBJECT",
@@ -150,8 +256,13 @@ export default function AdminPage() {
           const parsed = JSON.parse(jsonText.replace(/```json/g, '').replace(/```/g, ''));
           setFormData(prev => ({ ...prev, windowSticker: parsed }));
           setRawStickerText('');
+      } else {
+          setStickerError('Gemini returned an empty response. Please try again.');
       }
-    } catch (err) { console.error(err); }
+    } catch (err) {
+      console.error(err);
+      setStickerError(err.message || 'Failed to parse window sticker data with Gemini.');
+    }
     setIsStickerLoading(false);
   };
 
@@ -163,21 +274,9 @@ export default function AdminPage() {
       const dataUrl = await new Promise((resolve) => {
         const reader = new FileReader();
         reader.onerror = () => resolve(null);
-        reader.onload = (event) => {
-          const img = new window.Image();
-          img.onerror = () => resolve(null);
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            const MAX_SIZE = 600; 
-            let width = img.width; let height = img.height;
-            if (width > height) { if (width > MAX_SIZE) { height *= MAX_SIZE / width; width = MAX_SIZE; } } 
-            else { if (height > MAX_SIZE) { width *= MAX_SIZE / height; height = MAX_SIZE; } }
-            canvas.width = width; canvas.height = height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, width, height);
-            resolve(canvas.toDataURL('image/webp', 0.5)); 
-          };
-          img.src = event.target.result;
+        reader.onload = async (event) => {
+          const compressed = await compressImageDataUrl(event.target.result, 480, 0.4);
+          resolve(compressed);
         };
         reader.readAsDataURL(file);
       });
@@ -263,7 +362,12 @@ export default function AdminPage() {
               <button onClick={() => setEditingVin(null)} className="text-slate-400 hover:text-slate-700 bg-slate-100 p-2 rounded-full"><X size={20} /></button>
             </div>
             
-            {saveError && <div className="mb-6 p-4 bg-red-50 text-red-700 rounded-lg border border-red-200 text-sm font-medium">{saveError}</div>}
+            {saveError && (
+              <div className="mb-6 p-4 bg-red-50 text-red-700 rounded-lg border border-red-200 text-sm font-medium flex items-start gap-2">
+                <AlertCircle className="h-5 w-5 text-red-600 flex-shrink-0 mt-0.5" />
+                <span>{saveError}</span>
+              </div>
+            )}
 
             <div className="mb-6 p-5 bg-gradient-to-r from-indigo-50 to-blue-50 border border-indigo-100 rounded-xl shadow-sm">
               <div className="flex items-center mb-2 text-indigo-900 font-bold"><Sparkles className="h-5 w-5 mr-2 text-indigo-600" /> Auto-Fill Specs (Copart/IAAI/OpenLane)</div>
@@ -271,6 +375,12 @@ export default function AdminPage() {
               <button type="button" onClick={handleAiParse} disabled={isAiLoading || !rawAiText.trim()} className="mt-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-bold disabled:opacity-50 text-sm">
                 {isAiLoading ? 'Parsing...' : 'Extract Data'}
               </button>
+              {aiError && (
+                <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-xs font-medium flex items-start gap-2 break-words">
+                  <AlertCircle className="h-4 w-4 text-red-600 flex-shrink-0 mt-0.5" />
+                  <span>{aiError}</span>
+                </div>
+              )}
             </div>
 
             <div className="mb-8 p-5 bg-gradient-to-r from-slate-100 to-slate-200 border border-slate-300 rounded-xl shadow-sm">
@@ -282,6 +392,12 @@ export default function AdminPage() {
                 </button>
                 {formData.windowSticker && <span className="text-emerald-600 font-bold flex items-center text-sm"><CheckCircle className="h-4 w-4 mr-1"/> Sticker Loaded</span>}
               </div>
+              {stickerError && (
+                <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-xs font-medium flex items-start gap-2 break-words">
+                  <AlertCircle className="h-4 w-4 text-red-600 flex-shrink-0 mt-0.5" />
+                  <span>{stickerError}</span>
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleSave} className="space-y-6">
@@ -302,7 +418,12 @@ export default function AdminPage() {
                   <label className="block text-xs font-bold text-slate-500 uppercase mb-1">MSRP Sticker PDF (Optional)</label>
                   <div className="flex items-center gap-4">
                     <input type="file" accept="application/pdf" onChange={handlePdfUpload} className="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-slate-800 file:text-white hover:file:bg-slate-700 cursor-pointer border border-slate-300 rounded-lg p-1.5" />
-                    {formData.msrpStickerPdf && <span className="text-emerald-600 text-sm font-bold flex items-center whitespace-nowrap"><CheckCircle className="h-4 w-4 mr-1"/> PDF Ready</span>}
+                    {formData.msrpStickerPdf && (
+                      <div className="flex items-center gap-2 whitespace-nowrap">
+                        <span className="text-emerald-600 text-sm font-bold flex items-center"><CheckCircle className="h-4 w-4 mr-1"/> PDF Ready</span>
+                        <button type="button" onClick={() => setFormData(prev => ({ ...prev, msrpStickerPdf: null }))} className="text-xs text-red-500 hover:underline font-bold">Remove</button>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -317,7 +438,7 @@ export default function AdminPage() {
                 {['auction', 'shipment', 'container'].map(cat => (
                   <div key={cat} className="bg-slate-50 p-4 rounded-xl border border-slate-200">
                     <div className="flex justify-between items-center mb-3">
-                      <h4 className="font-bold capitalize text-slate-700">{cat} Photos</h4>
+                      <h4 className="font-bold capitalize text-slate-700">{cat} Photos ({formData.photos?.[cat]?.length || 0})</h4>
                       <label className="cursor-pointer bg-slate-800 text-white px-3 py-1.5 rounded-lg text-sm font-bold hover:bg-slate-700 transition-colors select-none">
                         Add Photos
                         <input
@@ -362,9 +483,16 @@ export default function AdminPage() {
                 ))}
               </div>
 
-              <div className="flex justify-end space-x-3 pt-6 border-t border-slate-200">
-                <button type="button" onClick={() => setEditingVin(null)} className="px-6 py-2.5 text-slate-600 font-bold hover:bg-slate-100 rounded-xl">Cancel</button>
-                <button type="submit" className="px-6 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 shadow-md">Save Vehicle</button>
+              <div className="flex flex-col sm:flex-row justify-between items-center gap-4 pt-6 border-t border-slate-200">
+                <div className={`text-xs font-mono font-bold px-3 py-1.5 rounded-lg border ${docSizeKB > 900 ? 'bg-red-50 text-red-700 border-red-200' : docSizeKB > 750 ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
+                  Storage Used: {docSizeKB} KB / 950 KB
+                </div>
+                <div className="flex space-x-3 w-full sm:w-auto justify-end">
+                  <button type="button" onClick={() => setEditingVin(null)} className="px-6 py-2.5 text-slate-600 font-bold hover:bg-slate-100 rounded-xl">Cancel</button>
+                  <button type="submit" disabled={isSaving} className="px-6 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 shadow-md disabled:opacity-50">
+                    {isSaving ? 'Saving...' : 'Save Vehicle'}
+                  </button>
+                </div>
               </div>
             </form>
           </div>
