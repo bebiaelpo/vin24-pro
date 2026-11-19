@@ -61,7 +61,9 @@ export default function AdminPage() {
 
   const handleEdit = (v) => { 
     setEditingVin(v.vin); 
-    const safePhotos = v.photos && typeof v.photos === 'object' && !Array.isArray(v.photos) ? v.photos : { auction: [], shipment: [], container: [] };
+    const safePhotos = v.photos && typeof v.photos === 'object' && !Array.isArray(v.photos)
+      ? { auction: [], shipment: [], container: [], ...v.photos }
+      : { auction: [], shipment: [], container: [] };
     setFormData({ ...v, photos: safePhotos }); 
   };
   
@@ -154,14 +156,16 @@ export default function AdminPage() {
   };
 
   const handleFileUpload = async (e, category) => {
-    const files = Array.from(e.target.files);
+    const files = Array.from(e.target.files || []);
     if (!files.length) return;
     const newUrls = [];
     for (const file of files) {
-      newUrls.push(await new Promise((resolve) => {
+      const dataUrl = await new Promise((resolve) => {
         const reader = new FileReader();
+        reader.onerror = () => resolve(null);
         reader.onload = (event) => {
           const img = new window.Image();
+          img.onerror = () => resolve(null);
           img.onload = () => {
             const canvas = document.createElement('canvas');
             const MAX_SIZE = 600; 
@@ -176,9 +180,22 @@ export default function AdminPage() {
           img.src = event.target.result;
         };
         reader.readAsDataURL(file);
+      });
+      if (dataUrl) newUrls.push(dataUrl);
+    }
+    e.target.value = '';
+    if (newUrls.length > 0) {
+      setFormData(prev => ({
+        ...prev,
+        photos: {
+          auction: [],
+          shipment: [],
+          container: [],
+          ...(prev.photos || {}),
+          [category]: [...(prev.photos?.[category] || []), ...newUrls]
+        }
       }));
     }
-    setFormData(prev => ({ ...prev, photos: { ...prev.photos, [category]: [...(prev.photos?.[category] || []), ...newUrls] } }));
   };
 
   // HTML5 Drag and Drop Handlers
@@ -194,7 +211,7 @@ export default function AdminPage() {
   const handleDrop = (e, cat, targetIdx) => {
     e.preventDefault();
     if (draggedCategory !== cat || draggedIdx === null || draggedIdx === targetIdx) return;
-    const newPhotos = [...formData.photos[cat]];
+    const newPhotos = [...(formData.photos?.[cat] || [])];
     const [movedPhoto] = newPhotos.splice(draggedIdx, 1);
     newPhotos.splice(targetIdx, 0, movedPhoto);
     setFormData({ ...formData, photos: { ...formData.photos, [cat]: newPhotos } });
@@ -204,11 +221,11 @@ export default function AdminPage() {
 
   // Button Shift Handlers (for easy mobile reordering)
   const shiftPhoto = (cat, idx, direction) => {
-    const newPhotos = [...formData.photos[cat]];
+    const newPhotos = [...(formData.photos?.[cat] || [])];
     if (direction === -1 && idx > 0) {
       [newPhotos[idx - 1], newPhotos[idx]] = [newPhotos[idx], newPhotos[idx - 1]];
     } else if (direction === 1 && idx < newPhotos.length - 1) {
-       [newPhotos[idx + 1], newPhotos[idx]] = [newPhotos[idx], newPhotos[idx + 1]];
+      [newPhotos[idx + 1], newPhotos[idx]] = [newPhotos[idx], newPhotos[idx + 1]];
     }
     setFormData({ ...formData, photos: { ...formData.photos, [cat]: newPhotos } });
   };
@@ -301,9 +318,15 @@ export default function AdminPage() {
                   <div key={cat} className="bg-slate-50 p-4 rounded-xl border border-slate-200">
                     <div className="flex justify-between items-center mb-3">
                       <h4 className="font-bold capitalize text-slate-700">{cat} Photos</h4>
-                      <label className="cursor-pointer bg-slate-800 text-white px-3 py-1.5 rounded-lg text-sm font-bold hover:bg-slate-700 transition-colors">
+                      <label className="cursor-pointer bg-slate-800 text-white px-3 py-1.5 rounded-lg text-sm font-bold hover:bg-slate-700 transition-colors select-none">
                         Add Photos
-                        <input type="file" multiple accept="image/*" className="hidden" onChange={(e) => handleFileUpload(e, cat)} disabled={!formData.vin} />
+                        <input
+                          type="file"
+                          multiple
+                          accept="image/*"
+                          className="sr-only"
+                          onChange={(e) => handleFileUpload(e, cat)}
+                        />
                       </label>
                     </div>
                     <div className="flex gap-2 overflow-x-auto pb-4 pt-2">
@@ -319,12 +342,12 @@ export default function AdminPage() {
                           <img src={url} alt="" className="w-full h-full object-cover pointer-events-none" />
                           
                           {/* Image Hover/Touch Overlay */}
-                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-between p-1">
+                          <div className="absolute inset-0 bg-black/40 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity flex flex-col justify-between p-1">
                             {/* Reorder Buttons (Best for Mobile) */}
                             <div className="flex justify-between items-center w-full mt-1 px-1">
-                              <button type="button" onClick={() => shiftPhoto(cat, i, -1)} disabled={i === 0} className="bg-white/20 text-white p-1 rounded hover:bg-white/40 disabled:opacity-30"><ChevronLeft size={16}/></button>
+                              <button type="button" onClick={() => shiftPhoto(cat, i, -1)} disabled={i === 0} className="bg-white/25 text-white p-1 rounded hover:bg-white/40 disabled:opacity-30"><ChevronLeft size={16}/></button>
                               <GripVertical size={16} className="text-white/80 cursor-move" />
-                              <button type="button" onClick={() => shiftPhoto(cat, i, 1)} disabled={i === formData.photos[cat].length - 1} className="bg-white/20 text-white p-1 rounded hover:bg-white/40 disabled:opacity-30"><ChevronRight size={16}/></button>
+                              <button type="button" onClick={() => shiftPhoto(cat, i, 1)} disabled={i === formData.photos[cat].length - 1} className="bg-white/25 text-white p-1 rounded hover:bg-white/40 disabled:opacity-30"><ChevronRight size={16}/></button>
                             </div>
                             
                             {/* Delete Button */}
