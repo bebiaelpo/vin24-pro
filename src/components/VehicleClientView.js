@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { ShieldCheck, CheckCircle, Receipt, Download, Sparkles, Image as ImageIcon, SearchX } from 'lucide-react';
+import { ShieldCheck, CheckCircle, Receipt, Download, Sparkles, Image as ImageIcon, SearchX, Maximize2, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import Header from '@/components/Header';
 import { translations, getInitialLanguage, callGeminiWithRetry } from '@/lib/translations';
 
@@ -18,6 +18,7 @@ export default function VehicleClientView({ vehicle, searchedVin }) {
   const [mainImageIdx, setMainImageIdx] = useState(0);
   const [translatedData, setTranslatedData] = useState(null);
   const [isTranslating, setIsTranslating] = useState(false);
+  const [isLightboxOpen, setIsLightboxOpen] = useState(false);
 
   useEffect(() => {
     setLang(getInitialLanguage());
@@ -85,6 +86,9 @@ export default function VehicleClientView({ vehicle, searchedVin }) {
     ...conditionText.split('\n').filter(l => l.trim().length > 0)
   ];
 
+  const nextImg = (e) => { e.stopPropagation(); setMainImageIdx((prev) => (prev + 1) % currentPhotos.length); };
+  const prevImg = (e) => { e.stopPropagation(); setMainImageIdx((prev) => (prev === 0 ? currentPhotos.length - 1 : prev - 1)); };
+
   return (
     <div className="min-h-screen flex flex-col font-sans bg-slate-50 text-slate-900">
       <Header />
@@ -135,8 +139,16 @@ export default function VehicleClientView({ vehicle, searchedVin }) {
             <div className="p-4 sm:p-6 bg-slate-100/50">
               {currentPhotos.length > 0 ? (
                 <>
-                  <div className="aspect-[21/9] sm:aspect-[16/7] bg-black rounded-xl overflow-hidden shadow-inner mb-4 relative group border border-slate-200">
-                    <img src={currentPhotos[mainImageIdx] || currentPhotos[0]} alt="Vehicle View" className="w-full h-full object-contain bg-slate-900" />
+                  <div 
+                    className="aspect-[21/9] sm:aspect-[16/7] bg-black rounded-xl overflow-hidden shadow-inner mb-4 relative group border border-slate-200 cursor-pointer"
+                    onClick={() => setIsLightboxOpen(true)}
+                  >
+                    <img src={currentPhotos[mainImageIdx] || currentPhotos[0]} alt="Vehicle View" className="w-full h-full object-contain bg-slate-900 transition-transform duration-300 group-hover:scale-[1.02]" />
+                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors flex items-center justify-center">
+                       <div className="bg-black/60 text-white p-3 rounded-full opacity-0 group-hover:opacity-100 transition-opacity backdrop-blur-sm shadow-lg flex items-center gap-2">
+                          <Maximize2 size={24} /> <span className="font-bold pr-2 hidden sm:block">Enlarge</span>
+                       </div>
+                    </div>
                   </div>
                   <div className="flex gap-3 overflow-x-auto pb-2 px-1 scrollbar-hide">
                     {currentPhotos.map((url, i) => (
@@ -264,9 +276,40 @@ export default function VehicleClientView({ vehicle, searchedVin }) {
               </div>
             </div>
           )}
-
         </div>
       </div>
+
+      {/* Fullscreen Lightbox Modal */}
+      {isLightboxOpen && (
+        <div className="fixed inset-0 z-[100] bg-black/95 flex items-center justify-center backdrop-blur-md" onClick={() => setIsLightboxOpen(false)}>
+          <button onClick={(e) => { e.stopPropagation(); setIsLightboxOpen(false); }} className="absolute top-4 right-4 sm:top-6 sm:right-6 text-white/70 hover:text-white p-2 z-[101]">
+            <X size={36} />
+          </button>
+          
+          {currentPhotos.length > 1 && (
+            <button onClick={prevImg} className="absolute left-2 sm:left-6 text-white/50 hover:text-white p-4 z-[101] transition-colors rounded-full hover:bg-black/50">
+              <ChevronLeft size={48} />
+            </button>
+          )}
+          
+          <img 
+            src={currentPhotos[mainImageIdx]} 
+            alt="Enlarged view" 
+            className="max-h-[85vh] max-w-[90vw] object-contain select-none"
+            onClick={(e) => e.stopPropagation()} 
+          />
+
+          {currentPhotos.length > 1 && (
+            <button onClick={nextImg} className="absolute right-2 sm:right-6 text-white/50 hover:text-white p-4 z-[101] transition-colors rounded-full hover:bg-black/50">
+              <ChevronRight size={48} />
+            </button>
+          )}
+          
+          <div className="absolute bottom-6 left-0 right-0 text-center text-white/70 font-mono text-sm tracking-widest z-[101]">
+            {mainImageIdx + 1} / {currentPhotos.length}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
