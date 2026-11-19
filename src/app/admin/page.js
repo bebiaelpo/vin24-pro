@@ -1,965 +1,331 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import Link from 'next/link';
-import { auth, db, storage } from '@/lib/firebase';
-import { signInWithEmailAndPassword, onAuthStateChanged, signOut } from 'firebase/auth';
-import { collection, doc, setDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import Logo from '@/components/Logo';
-import {
-  Trash2,
-  Upload,
-  LogOut,
-  Plus,
-  CheckCircle,
-  AlertCircle,
-  Wand2,
-  Sparkles,
-  Pencil,
-  X,
-  Loader2,
-  Search,
-  ExternalLink,
-} from 'lucide-react';
+import { ShieldCheck, Plus, X, Sparkles, Receipt, CheckCircle, Lock } from 'lucide-react';
+import { doc, setDoc, deleteDoc, collection, onSnapshot } from 'firebase/firestore';
+import { signInWithEmailAndPassword, onAuthStateChanged } from 'firebase/auth';
+import { db, auth } from '@/lib/firebase';
+import Header from '@/components/Header';
+import { callGeminiWithRetry } from '@/lib/translations';
 
-function formatTitleCase(str) {
-  if (!str) return '';
-  const acronyms = [
-    'BMW', 'GMC', 'VW', 'RAM', 'SRT', 'GT', 'SE', 'LE', 'XLE', 'XSE',
-    'AWD', 'FWD', 'RWD', '4WD', 'SUV', 'LTD', 'EX', 'LX', 'DX', 'SI',
-  ];
-  return str
-    .trim()
-    .split(/\s+/)
-    .map((word) => {
-      const upper = word.toUpperCase();
-      if (acronyms.includes(upper)) return upper;
-      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
-    })
-    .join(' ');
-}
+const safeStr = (val) => {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'object') return JSON.stringify(val);
+  return String(val);
+};
 
-function decodeAuctionText(raw) {
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const pairs = [];
-  const leftoverNotes = [];
-
-  const knownLabels = [
-    'vin', 'lot', 'lot number', 'lot #', 'odometer', 'mileage',
-    'primary damage', 'secondary damage', 'title', 'title type',
-    'title/sale doc', 'sale document', 'doc type', 'keys', 'highlights',
-    'start code', 'run & drive', 'engine', 'engine type', 'cylinders',
-    'transmission', 'drive', 'drivetrain', 'fuel', 'fuel type',
-    'color', 'exterior color', 'interior color', 'body style',
-    'vehicle type', 'loss', 'loss type', 'damage', 'est. retail value',
-    'estimated retail value', 'actual cash value', 'acv', 'repair cost',
-    'sale date', 'location', 'seller', 'airbags', 'notes', 'condition',
-  ];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Case 1: "Label: Value" or "Label\tValue"
-    const colonMatch = line.match(/^([^:\t]{2,35})[:\t]\s*(.+)$/);
-    if (colonMatch) {
-      pairs.push({ label: colonMatch[1].trim(), value: colonMatch[2].trim() });
-      continue;
-    }
-
-    // Case 2: Copied HTML table where Label is on line i and Value is on line i+1
-    const normalizedLabel = line.replace(/:$/, '').toLowerCase();
-    if (knownLabels.includes(normalizedLabel) && i + 1 < lines.length) {
-      const nextLine = lines[i + 1];
-      if (!knownLabels.includes(nextLine.replace(/:$/, '').toLowerCase())) {
-        pairs.push({ label: formatTitleCase(normalizedLabel), value: nextLine });
-        i++;
-        continue;
-      }
-    }
-
-    leftoverNotes.push(line);
-  }
-
-  const extracted = {
-    vin: '',
-    lotNumber: '',
-    mileage: '',
-    primaryDamage: '',
-    secondaryDamage: '',
-    titleStatus: '',
-    keys: '',
-    engine: '',
-    transmission: '',
-    drivetrain: '',
-    fuelType: '',
-    color: '',
-    location: '',
-    reportDetails: [],
-    formattedNotes: '',
-  };
-
-  const seenLabels = new Set();
-
-  pairs.forEach(({ label, value }) => {
-    const key = label.toLowerCase();
-    if (seenLabels.has(key)) return;
-    seenLabels.add(key);
-
-    if (key === 'vin' && value.length >= 11) {
-      extracted.vin = value.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 17);
-    } else if (key.includes('lot')) {
-      extracted.lotNumber = value.replace(/^#/, '');
-    } else if (key.includes('odometer') || key.includes('mileage')) {
-      extracted.mileage = value;
-    } else if (key.includes('primary damage') || key === 'damage') {
-      extracted.primaryDamage = value;
-    } else if (key.includes('secondary damage')) {
-      extracted.secondaryDamage = value;
-    } else if (key.includes('title') || key.includes('sale doc') || key.includes('doc type')) {
-      extracted.titleStatus = value;
-    } else if (key === 'keys') {
-      extracted.keys = value;
-    } else if (key.includes('engine')) {
-      extracted.engine = value;
-    } else if (key.includes('transmission')) {
-      extracted.transmission = value;
-    } else if (key.includes('drive')) {
-      extracted.drivetrain = value;
-    } else if (key.includes('fuel')) {
-      extracted.fuelType = value;
-    } else if (key.includes('color') && !key.includes('interior')) {
-      extracted.color = value;
-    } else if (key.includes('location')) {
-      extracted.location = value;
-    }
-
-    if (key !== 'vin') {
-      extracted.reportDetails.push({
-        label: formatTitleCase(label),
-        value,
-      });
-    }
-  });
-
-  const formattedLines = [];
-  if (extracted.reportDetails.length > 0) {
-    extracted.reportDetails.forEach((item) => {
-      formattedLines.push(`• ${item.label}: ${item.value}`);
-    });
-  }
-  if (leftoverNotes.length > 0) {
-    if (formattedLines.length > 0) formattedLines.push('');
-    leftoverNotes.forEach((note) => {
-      formattedLines.push(note.startsWith('•') ? note : `• ${note}`);
-    });
-  }
-
-  extracted.formattedNotes = formattedLines.join('\n');
-  return extracted;
-}
-
-export default function AdminDashboard() {
+export default function AdminPage() {
   const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [authError, setAuthError] = useState('');
-
-  // Form state
-  const [editingVin, setEditingVin] = useState(null);
-  const [vin, setVin] = useState('');
-  const [lotNumber, setLotNumber] = useState('');
-  const [year, setYear] = useState('');
-  const [make, setMake] = useState('');
-  const [model, setModel] = useState('');
-  const [mileage, setMileage] = useState('');
-  const [engine, setEngine] = useState('');
-  const [transmission, setTransmission] = useState('');
-  const [drivetrain, setDrivetrain] = useState('');
-  const [fuelType, setFuelType] = useState('');
-  const [color, setColor] = useState('');
-  const [titleStatus, setTitleStatus] = useState('');
-  const [primaryDamage, setPrimaryDamage] = useState('');
-  const [secondaryDamage, setSecondaryDamage] = useState('');
-  const [keys, setKeys] = useState('');
-  const [location, setLocation] = useState('');
-  const [notes, setNotes] = useState('');
-  const [reportDetails, setReportDetails] = useState([]);
-  const [existingPhotos, setExistingPhotos] = useState([]);
-  const [newPhotos, setNewPhotos] = useState([]);
-
-  // UI & Inventory state
-  const [decodingVin, setDecodingVin] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [statusMsg, setStatusMsg] = useState({ type: '', text: '' });
+  const [error, setError] = useState('');
   const [vehicles, setVehicles] = useState([]);
-  const [searchFilter, setSearchFilter] = useState('');
+  
+  // Dashboard Form State
+  const [editingVin, setEditingVin] = useState(null);
+  const [saveError, setSaveError] = useState('');
+  const [formData, setFormData] = useState({ vin: '', year: '', make: '', model: '', mileage: '', owners: '', engine: '', fuel: '', cylinders: '', options: '', condition: '', titleStatus: 'Clean Title', sellerName: '', sellerLocation: '', msrpStickerPdf: null, windowSticker: null, photos: { auction: [], shipment: [], container: [] } });
+  
+  const [rawAiText, setRawAiText] = useState('');
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [rawStickerText, setRawStickerText] = useState('');
+  const [isStickerLoading, setIsStickerLoading] = useState(false);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setAuthLoading(false);
-    });
+    const unsubscribe = onAuthStateChanged(auth, setUser);
     return () => unsubscribe();
   }, []);
 
   useEffect(() => {
     if (!user) return;
     const unsubscribe = onSnapshot(collection(db, 'vehicles'), (snapshot) => {
-      const list = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
-      list.sort((a, b) => (b.uploadDate || '').localeCompare(a.uploadDate || ''));
-      setVehicles(list);
+      const vList = [];
+      snapshot.forEach(doc => vList.push(doc.data()));
+      setVehicles(vList);
     });
     return () => unsubscribe();
   }, [user]);
 
   const handleLogin = async (e) => {
     e.preventDefault();
-    setAuthError('');
     try {
       await signInWithEmailAndPassword(auth, email, password);
     } catch (err) {
-      setAuthError('Invalid email or password. Check your Firebase Authentication users.');
+      setError('Invalid admin credentials.');
     }
   };
 
-  const handleLogout = async () => {
-    await signOut(auth);
+  const handleEdit = (v) => { 
+    setEditingVin(v.vin); 
+    const safePhotos = v.photos && typeof v.photos === 'object' && !Array.isArray(v.photos) ? v.photos : { auction: [], shipment: [], container: [] };
+    setFormData({ ...v, photos: safePhotos }); 
+  };
+  
+  const handleNew = () => { 
+    setEditingVin('NEW'); 
+    setFormData({ vin: '', year: '', make: '', model: '', mileage: '', owners: '', engine: '', fuel: '', cylinders: '', options: '', condition: '', titleStatus: 'Clean Title', sellerName: '', sellerLocation: '', msrpStickerPdf: null, windowSticker: null, photos: { auction: [], shipment: [], container: [] } }); 
+  };
+  
+  const handleDelete = async (vin) => { 
+    if (!confirm('Permanently delete this vehicle?')) return;
+    try { await deleteDoc(doc(db, 'vehicles', vin)); } 
+    catch (err) { console.error(err); } 
   };
 
-  const handleDecodeVin = async (targetVin = vin) => {
-    const cleanVin = targetVin.trim().toUpperCase();
-    if (cleanVin.length !== 17) {
-      setStatusMsg({ type: 'error', text: 'Enter a full 17-character VIN first to auto-decode.' });
-      return;
-    }
-
-    setDecodingVin(true);
-    setStatusMsg({ type: '', text: '' });
-
-    try {
-      const res = await fetch(
-        `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/${cleanVin}?format=json`
-      );
-      const data = await res.json();
-      const info = data?.Results?.[0];
-
-      if (!info || (!info.Make && !info.ModelYear)) {
-        setStatusMsg({
-          type: 'error',
-          text: 'Could not auto-decode this VIN from NHTSA. Enter details manually.',
-        });
-        return;
-      }
-
-      if (info.ModelYear) setYear(info.ModelYear);
-      if (info.Make) setMake(formatTitleCase(info.Make));
-
-      const modelParts = [info.Model, info.Trim].filter(Boolean).join(' ');
-      if (modelParts) setModel(formatTitleCase(modelParts));
-
-      const engineParts = [];
-      if (info.DisplacementL) engineParts.push(`${parseFloat(info.DisplacementL).toFixed(1)}L`);
-      if (info.EngineCylinders) engineParts.push(`${info.EngineCylinders}-Cyl`);
-      if (engineParts.length > 0) setEngine(engineParts.join(' '));
-
-      if (info.TransmissionStyle) setTransmission(formatTitleCase(info.TransmissionStyle));
-      if (info.DriveType) setDrivetrain(info.DriveType.toUpperCase());
-      if (info.FuelTypePrimary) setFuelType(formatTitleCase(info.FuelTypePrimary));
-
-      setStatusMsg({
-        type: 'success',
-        text: `Auto-Decoded: ${info.ModelYear || ''} ${formatTitleCase(info.Make)} ${formatTitleCase(info.Model)}`,
-      });
-    } catch (error) {
-      console.error('VIN Decode error:', error);
-      setStatusMsg({ type: 'error', text: 'VIN lookup failed. Check your connection.' });
-    } finally {
-      setDecodingVin(false);
-    }
-  };
-
-  const handleSmartFormatNotes = () => {
-    if (!notes.trim()) {
-      setStatusMsg({
-        type: 'error',
-        text: 'Paste raw auction condition/history text into the Notes box first.',
-      });
-      return;
-    }
-
-    const decoded = decodeAuctionText(notes);
-
-    if (decoded.vin && !vin) {
-      setVin(decoded.vin);
-      if (decoded.vin.length === 17) handleDecodeVin(decoded.vin);
-    }
-    if (decoded.lotNumber) setLotNumber(decoded.lotNumber);
-    if (decoded.mileage) setMileage(decoded.mileage);
-    if (decoded.primaryDamage) setPrimaryDamage(decoded.primaryDamage);
-    if (decoded.secondaryDamage) setSecondaryDamage(decoded.secondaryDamage);
-    if (decoded.titleStatus) setTitleStatus(decoded.titleStatus);
-    if (decoded.keys) setKeys(decoded.keys);
-    if (decoded.engine && !engine) setEngine(decoded.engine);
-    if (decoded.transmission && !transmission) setTransmission(decoded.transmission);
-    if (decoded.drivetrain && !drivetrain) setDrivetrain(decoded.drivetrain);
-    if (decoded.fuelType && !fuelType) setFuelType(decoded.fuelType);
-    if (decoded.color) setColor(decoded.color);
-    if (decoded.location) setLocation(decoded.location);
-
-    setReportDetails(decoded.reportDetails);
-    setNotes(decoded.formattedNotes);
-
-    setStatusMsg({
-      type: 'success',
-      text: `Decoded ${decoded.reportDetails.length} auction fields and formatted the report cleanly!`,
-    });
-  };
-
-  const resetForm = () => {
-    setEditingVin(null);
-    setVin('');
-    setLotNumber('');
-    setYear('');
-    setMake('');
-    setModel('');
-    setMileage('');
-    setEngine('');
-    setTransmission('');
-    setDrivetrain('');
-    setFuelType('');
-    setColor('');
-    setTitleStatus('');
-    setPrimaryDamage('');
-    setSecondaryDamage('');
-    setKeys('');
-    setLocation('');
-    setNotes('');
-    setReportDetails([]);
-    setExistingPhotos([]);
-    setNewPhotos([]);
-    const input = document.getElementById('photo-input');
-    if (input) input.value = '';
-  };
-
-  const handleStartEdit = (vehicle) => {
-    setEditingVin(vehicle.vin);
-    setVin(vehicle.vin || '');
-    setLotNumber(vehicle.lotNumber || '');
-    setYear(vehicle.year || '');
-    setMake(vehicle.make || '');
-    setModel(vehicle.model || '');
-    setMileage(vehicle.mileage || '');
-    setEngine(vehicle.engine || '');
-    setTransmission(vehicle.transmission || '');
-    setDrivetrain(vehicle.drivetrain || '');
-    setFuelType(vehicle.fuelType || '');
-    setColor(vehicle.color || '');
-    setTitleStatus(vehicle.titleStatus || '');
-    setPrimaryDamage(vehicle.primaryDamage || '');
-    setSecondaryDamage(vehicle.secondaryDamage || '');
-    setKeys(vehicle.keys || '');
-    setLocation(vehicle.location || '');
-    setNotes(vehicle.notes || '');
-    setReportDetails(Array.isArray(vehicle.reportDetails) ? vehicle.reportDetails : []);
-    setExistingPhotos(Array.isArray(vehicle.photos) ? vehicle.photos : []);
-    setNewPhotos([]);
-    setStatusMsg({
-      type: 'success',
-      text: `Editing VIN ${vehicle.vin}. Make your changes and click Update.`,
-    });
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const handleRemoveExistingPhoto = (indexToRemove) => {
-    setExistingPhotos((prev) => prev.filter((_, idx) => idx !== indexToRemove));
-  };
-
-  const handleSaveVehicle = async (e) => {
+  const handleSave = async (e) => {
     e.preventDefault();
-    const cleanVin = vin.trim().toUpperCase();
-    if (cleanVin.length !== 17) {
-      setStatusMsg({ type: 'error', text: 'VIN must be exactly 17 characters.' });
-      return;
-    }
-
-    setUploading(true);
-    setStatusMsg({ type: '', text: '' });
-
+    setSaveError('');
     try {
-      const uploadedUrls = [];
-      for (let i = 0; i < newPhotos.length; i++) {
-        const file = newPhotos[i];
-        const storageRef = ref(storage, `vehicles/${cleanVin}/${Date.now()}_${file.name}`);
-        await uploadBytes(storageRef, file);
-        const url = await getDownloadURL(storageRef);
-        uploadedUrls.push(url);
+      const vinUpper = safeStr(formData.vin).trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if(!vinUpper) { setSaveError("Valid VIN required."); return; }
+      const docRef = doc(db, 'vehicles', vinUpper);
+      const safeData = JSON.parse(JSON.stringify({ ...formData, vin: vinUpper }));
+      await setDoc(docRef, safeData);
+      setEditingVin(null);
+    } catch (err) { 
+      if (err.message?.includes("size") || err.message?.includes("1048576")) {
+        setSaveError("Save failed. Firestore max document size (1MB) reached. Upload fewer photos.");
+      } else {
+        setSaveError(`Save failed: ${err.message}`);
       }
-
-      const finalPhotos = [...existingPhotos, ...uploadedUrls];
-
-      await setDoc(doc(db, 'vehicles', cleanVin), {
-        vin: cleanVin,
-        lotNumber: lotNumber.trim(),
-        year: year.trim(),
-        make: make.trim(),
-        model: model.trim(),
-        mileage: mileage.trim(),
-        engine: engine.trim(),
-        transmission: transmission.trim(),
-        drivetrain: drivetrain.trim(),
-        fuelType: fuelType.trim(),
-        color: color.trim(),
-        titleStatus: titleStatus.trim(),
-        primaryDamage: primaryDamage.trim(),
-        secondaryDamage: secondaryDamage.trim(),
-        keys: keys.trim(),
-        location: location.trim(),
-        notes: notes.trim(),
-        reportDetails,
-        photos: finalPhotos,
-        uploadDate: new Date().toISOString(),
-      });
-
-      setStatusMsg({
-        type: 'success',
-        text: editingVin
-          ? `Vehicle ${cleanVin} updated successfully!`
-          : `Vehicle ${cleanVin} published and added to sitemap!`,
-      });
-
-      resetForm();
-    } catch (error) {
-      console.error('Save error:', error);
-      setStatusMsg({ type: 'error', text: 'Failed to save vehicle. Check Firebase permissions.' });
-    } finally {
-      setUploading(false);
     }
   };
 
-  const handleDeleteVehicle = async (vehicleId) => {
-    if (!confirm(`Are you sure you want to permanently delete VIN ${vehicleId}?`)) return;
+  const handlePdfUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => setFormData(prev => ({ ...prev, msrpStickerPdf: event.target.result }));
+    reader.readAsDataURL(file);
+  };
+
+  const handleAiParse = async () => {
+    if (!rawAiText.trim()) return;
+    setIsAiLoading(true);
     try {
-      await deleteDoc(doc(db, 'vehicles', vehicleId));
-      if (editingVin === vehicleId) resetForm();
-    } catch (error) {
-      console.error('Delete error:', error);
-      alert('Failed to delete vehicle.');
-    }
+      const schema = { type: "OBJECT", properties: { vin: { type: "STRING" }, year: { type: "STRING" }, make: { type: "STRING" }, model: { type: "STRING" }, mileage: { type: "STRING" }, owners: { type: "STRING" }, engine: { type: "STRING" }, fuel: { type: "STRING" }, cylinders: { type: "STRING" }, options: { type: "STRING" }, condition: { type: "STRING" }, sellerName: { type: "STRING" }, sellerLocation: { type: "STRING" } } };
+      const payload = {
+          contents: [{ parts: [{ text: `Parse this auction data. Extract VIN, seller name, seller state, year, make, model, engine, fuel, cylinders, options, owners, mileage. Format condition as a strict bulleted list like 'Category: Detail' separated by newlines.\n\nRaw Data:\n${rawAiText}` }] }],
+          systemInstruction: { parts: [{ text: "Extract vehicle details into strict JSON structure without conversational text." }] },
+          generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+      };
+      const result = await callGeminiWithRetry(payload);
+      const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (jsonText) {
+          const parsed = JSON.parse(jsonText.replace(/```json/g, '').replace(/```/g, ''));
+          setFormData(prev => ({ ...prev, ...parsed }));
+          setRawAiText('');
+      }
+    } catch (err) { console.error(err); }
+    setIsAiLoading(false);
   };
 
-  const filteredVehicles = vehicles.filter((v) => {
-    const q = searchFilter.toLowerCase();
-    return (
-      v.vin?.toLowerCase().includes(q) ||
-      v.make?.toLowerCase().includes(q) ||
-      v.model?.toLowerCase().includes(q) ||
-      v.year?.toString().includes(q)
-    );
-  });
+  const handleStickerParse = async () => {
+    if (!rawStickerText.trim()) return;
+    setIsStickerLoading(true);
+    try {
+      const schema = {
+        type: "OBJECT",
+        properties: {
+          basePrice: { type: "STRING" }, totalPrice: { type: "STRING" },
+          mechanical: { type: "ARRAY", items: { type: "STRING" } }, safety: { type: "ARRAY", items: { type: "STRING" } },
+          exterior: { type: "ARRAY", items: { type: "STRING" } }, interior: { type: "ARRAY", items: { type: "STRING" } },
+          optional: { type: "ARRAY", items: { type: "OBJECT", properties: { name: { type: "STRING" }, price: { type: "STRING" } } } }
+        }
+      };
+      const payload = {
+          contents: [{ parts: [{ text: `Parse this raw OCR Window Sticker text into standard Monroney categories. Find base MSRP and total price.\n\nRaw Data:\n${rawStickerText}` }] }],
+          systemInstruction: { parts: [{ text: "Extract Monroney window sticker data into structured JSON." }] },
+          generationConfig: { responseMimeType: "application/json", responseSchema: schema }
+      };
+      const result = await callGeminiWithRetry(payload);
+      const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (jsonText) {
+          const parsed = JSON.parse(jsonText.replace(/```json/g, '').replace(/```/g, ''));
+          setFormData(prev => ({ ...prev, windowSticker: parsed }));
+          setRawStickerText('');
+      }
+    } catch (err) { console.error(err); }
+    setIsStickerLoading(false);
+  };
 
-  if (authLoading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white">
-        Loading Admin Portal...
-      </div>
-    );
-  }
+  const handleFileUpload = async (e, category) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    const newUrls = [];
+    for (const file of files) {
+      newUrls.push(await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const img = new window.Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const MAX_SIZE = 600; 
+            let width = img.width; let height = img.height;
+            if (width > height) { if (width > MAX_SIZE) { height *= MAX_SIZE / width; width = MAX_SIZE; } } 
+            else { if (height > MAX_SIZE) { width *= MAX_SIZE / height; height = MAX_SIZE; } }
+            canvas.width = width; canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/webp', 0.5)); 
+          };
+          img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+      }));
+    }
+    setFormData(prev => ({ ...prev, photos: { ...prev.photos, [category]: [...(prev.photos?.[category] || []), ...newUrls] } }));
+  };
 
   if (!user) {
     return (
-      <main className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
-        <div className="max-w-md w-full bg-white rounded-2xl shadow-2xl p-8">
-          <div className="flex flex-col items-center text-center mb-6">
-            <Logo variant="dark" size="lg" />
-            <p className="text-sm text-slate-500 mt-3">Sign in to manage VIN24.pro inventory</p>
+      <div className="min-h-screen bg-slate-100 flex flex-col">
+        <Header />
+        <div className="flex-grow flex items-center justify-center p-4">
+          <div className="bg-white p-8 rounded-2xl shadow-lg max-w-md w-full border border-slate-200">
+            <div className="flex flex-col items-center mb-6">
+              <div className="h-16 w-16 bg-slate-900 rounded-2xl flex items-center justify-center mb-4 shadow-sm"><Lock className="h-8 w-8 text-emerald-400" /></div>
+              <h2 className="text-2xl font-extrabold text-slate-900">Admin Login</h2>
+            </div>
+            <form onSubmit={handleLogin} className="space-y-5">
+              <div><input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="Email" className="w-full px-4 py-3 border rounded-xl" /></div>
+              <div><input type="password" required value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" className="w-full px-4 py-3 border rounded-xl" /></div>
+              {error && <p className="text-red-500 text-sm">{error}</p>}
+              <button type="submit" className="w-full py-3 bg-slate-900 text-white rounded-xl font-bold">Login</button>
+            </form>
           </div>
-
-          {authError && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{authError}</span>
-            </div>
-          )}
-
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Admin Email</label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="w-full px-4 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                placeholder="admin@vin24.pro"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-4 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                placeholder="••••••••"
-              />
-            </div>
-            <button
-              type="submit"
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition"
-            >
-              Sign In
-            </button>
-          </form>
         </div>
-      </main>
+      </div>
     );
   }
 
   return (
-    <main className="min-h-screen bg-slate-100 pb-12">
-      <header className="bg-slate-950 text-white shadow-md border-b border-slate-800">
-        <div className="max-w-7xl mx-auto px-4 py-3.5 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Link href="/">
-              <Logo variant="light" size="md" />
-            </Link>
-            <span className="text-xs font-bold uppercase tracking-wider bg-slate-800 text-slate-300 px-2.5 py-1 rounded">
-              Admin
-            </span>
-          </div>
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-slate-400 hidden sm:inline">{user.email}</span>
-            <button
-              onClick={handleLogout}
-              className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 px-3.5 py-2 rounded-lg text-sm transition"
-            >
-              <LogOut className="w-4 h-4" /> Logout
-            </button>
-          </div>
-        </div>
-      </header>
+    <div className="min-h-screen flex flex-col font-sans bg-slate-100 text-slate-900">
+      <Header />
+      {editingVin ? (
+        <div className="flex-grow p-4 sm:p-8 bg-slate-100">
+          <div className="max-w-4xl mx-auto bg-white p-6 sm:p-8 rounded-2xl shadow-lg border border-slate-200">
+            <div className="flex justify-between items-center mb-6 pb-4 border-b border-slate-100">
+              <h2 className="text-2xl font-bold text-slate-800">{editingVin === 'NEW' ? 'Add New Vehicle' : `Edit: ${editingVin}`}</h2>
+              <button onClick={() => setEditingVin(null)} className="text-slate-400 hover:text-slate-700 bg-slate-100 p-2 rounded-full"><X size={20} /></button>
+            </div>
+            
+            {saveError && <div className="mb-6 p-4 bg-red-50 text-red-700 rounded-lg border border-red-200 text-sm font-medium">{saveError}</div>}
 
-      <div className="max-w-7xl mx-auto px-4 mt-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Left 2 Columns: Add / Edit Vehicle Form */}
-        <div className="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-          <div className="flex items-center justify-between mb-5">
-            <h1 className="text-xl font-bold text-slate-900 flex items-center gap-2">
-              {editingVin ? (
-                <>
-                  <Pencil className="w-5 h-5 text-amber-600" /> Edit Vehicle: {editingVin}
-                </>
-              ) : (
-                <>
-                  <Plus className="w-5 h-5 text-blue-600" /> Add New Vehicle Report
-                </>
-              )}
-            </h1>
-
-            {editingVin && (
-              <button
-                type="button"
-                onClick={resetForm}
-                className="flex items-center gap-1 text-xs font-semibold bg-slate-200 hover:bg-slate-300 text-slate-800 px-3 py-1.5 rounded-lg transition"
-              >
-                <X className="w-3.5 h-3.5" /> Cancel Edit
+            <div className="mb-6 p-5 bg-gradient-to-r from-indigo-50 to-blue-50 border border-indigo-100 rounded-xl shadow-sm">
+              <div className="flex items-center mb-2 text-indigo-900 font-bold"><Sparkles className="h-5 w-5 mr-2 text-indigo-600" /> Auto-Fill Specs (Copart/IAAI/OpenLane)</div>
+              <textarea value={rawAiText} onChange={e => setRawAiText(e.target.value)} placeholder="Paste auction text here..." className="w-full border border-indigo-200 rounded-lg p-3 text-sm focus:ring-2 focus:ring-indigo-500 bg-white min-h-[80px] outline-none" />
+              <button type="button" onClick={handleAiParse} disabled={isAiLoading || !rawAiText.trim()} className="mt-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-bold disabled:opacity-50 text-sm">
+                {isAiLoading ? 'Parsing...' : 'Extract Data'}
               </button>
-            )}
-          </div>
-
-          {statusMsg.text && (
-            <div
-              className={`mb-6 p-4 rounded-xl flex items-center gap-2 text-sm font-medium ${
-                statusMsg.type === 'success'
-                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                  : 'bg-red-50 text-red-800 border border-red-200'
-              }`}
-            >
-              {statusMsg.type === 'success' ? (
-                <CheckCircle className="w-5 h-5 shrink-0" />
-              ) : (
-                <AlertCircle className="w-5 h-5 shrink-0" />
-              )}
-              <span>{statusMsg.text}</span>
             </div>
-          )}
 
-          <form onSubmit={handleSaveVehicle} className="space-y-4">
-            {/* VIN Input + 1-Click Auto Decode */}
-            <div>
-              <label className="block text-xs font-bold uppercase text-slate-500 mb-1">
-                17-Digit VIN *
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  required
-                  maxLength={17}
-                  disabled={Boolean(editingVin)}
-                  value={vin}
-                  onChange={(e) => {
-                    const val = e.target.value.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-                    setVin(val);
-                    if (val.length === 17 && !editingVin) {
-                      handleDecodeVin(val);
-                    }
-                  }}
-                  placeholder="Enter 17-digit VIN to auto-fill specs..."
-                  className="w-full px-4 py-2.5 border border-slate-300 rounded-lg font-mono uppercase focus:ring-2 focus:ring-blue-600 outline-none disabled:bg-slate-100"
-                />
-                <button
-                  type="button"
-                  onClick={() => handleDecodeVin(vin)}
-                  disabled={decodingVin || vin.length !== 17}
-                  className="shrink-0 flex items-center gap-1.5 bg-slate-950 hover:bg-slate-800 disabled:bg-slate-300 text-white text-sm font-semibold px-4 py-2.5 rounded-lg transition"
-                >
-                  {decodingVin ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Wand2 className="w-4 h-4 text-blue-400" />
-                  )}
-                  <span>{decodingVin ? 'Decoding...' : 'Auto-Decode'}</span>
+            <div className="mb-8 p-5 bg-gradient-to-r from-slate-100 to-slate-200 border border-slate-300 rounded-xl shadow-sm">
+              <div className="flex items-center mb-2 text-slate-900 font-bold"><Receipt className="h-5 w-5 mr-2 text-slate-700" /> Build Window Sticker</div>
+              <textarea value={rawStickerText} onChange={e => setRawStickerText(e.target.value)} placeholder="Paste raw OCR Window Sticker text here..." className="w-full border border-slate-300 rounded-lg p-3 text-sm focus:ring-2 focus:ring-slate-500 bg-white min-h-[80px] outline-none" />
+              <div className="flex items-center justify-between mt-2">
+                <button type="button" onClick={handleStickerParse} disabled={isStickerLoading || !rawStickerText.trim()} className="px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900 font-bold disabled:opacity-50 text-sm">
+                  {isStickerLoading ? 'Building Sticker...' : 'Parse Sticker Data'}
                 </button>
+                {formData.windowSticker && <span className="text-emerald-600 font-bold flex items-center text-sm"><CheckCircle className="h-4 w-4 mr-1"/> Sticker Loaded</span>}
               </div>
             </div>
 
-            {/* Primary Vehicle Identity */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Year *</label>
-                <input
-                  type="text"
-                  required
-                  value={year}
-                  onChange={(e) => setYear(e.target.value)}
-                  placeholder="2022"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Make *</label>
-                <input
-                  type="text"
-                  required
-                  value={make}
-                  onChange={(e) => setMake(e.target.value)}
-                  placeholder="Toyota"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Model *</label>
-                <input
-                  type="text"
-                  required
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  placeholder="Camry SE"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-            </div>
+            <form onSubmit={handleSave} className="space-y-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">VIN</label><input required disabled={editingVin !== 'NEW'} value={formData.vin} onChange={e=>setFormData({...formData, vin: e.target.value.toUpperCase()})} className="w-full border border-slate-300 rounded-lg p-2.5 disabled:bg-slate-100 font-mono" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Title Status</label><input required value={formData.titleStatus} onChange={e=>setFormData({...formData, titleStatus: e.target.value})} className="w-full border border-emerald-300 rounded-lg p-2.5 font-bold text-emerald-800 bg-emerald-50" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Seller Name</label><input value={formData.sellerName || ''} onChange={e=>setFormData({...formData, sellerName: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Seller State</label><input value={formData.sellerLocation || ''} onChange={e=>setFormData({...formData, sellerLocation: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Year</label><input value={formData.year} onChange={e=>setFormData({...formData, year: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Make</label><input value={formData.make} onChange={e=>setFormData({...formData, make: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Model</label><input value={formData.model} onChange={e=>setFormData({...formData, model: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Mileage</label><input value={formData.mileage} onChange={e=>setFormData({...formData, mileage: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Engine</label><input value={formData.engine} onChange={e=>setFormData({...formData, engine: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Cylinders</label><input value={formData.cylinders || ''} onChange={e=>setFormData({...formData, cylinders: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Fuel Type</label><input value={formData.fuel} onChange={e=>setFormData({...formData, fuel: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-bold text-slate-500 uppercase mb-1">MSRP Sticker PDF (Optional)</label>
+                  <div className="flex items-center gap-4">
+                    <input type="file" accept="application/pdf" onChange={handlePdfUpload} className="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-slate-800 file:text-white hover:file:bg-slate-700 cursor-pointer border border-slate-300 rounded-lg p-1.5" />
+                    {formData.msrpStickerPdf && <span className="text-emerald-600 text-sm font-bold flex items-center whitespace-nowrap"><CheckCircle className="h-4 w-4 mr-1"/> PDF Ready</span>}
+                  </div>
+                </div>
 
-            {/* Technical & Auction Fields */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Engine</label>
-                <input
-                  type="text"
-                  value={engine}
-                  onChange={(e) => setEngine(e.target.value)}
-                  placeholder="2.5L 4-Cyl"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
+                <div className="sm:col-span-2"><label className="block text-xs font-bold text-slate-500 uppercase mb-1">Options</label><input value={formData.options} onChange={e=>setFormData({...formData, options: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5" /></div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Condition (Format: "Category: Description")</label>
+                  <textarea rows="4" value={formData.condition} onChange={e=>setFormData({...formData, condition: e.target.value})} className="w-full border border-slate-300 rounded-lg p-2.5 font-mono text-sm"></textarea>
+                </div>
               </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Transmission</label>
-                <input
-                  type="text"
-                  value={transmission}
-                  onChange={(e) => setTransmission(e.target.value)}
-                  placeholder="Automatic"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Drivetrain</label>
-                <input
-                  type="text"
-                  value={drivetrain}
-                  onChange={(e) => setDrivetrain(e.target.value)}
-                  placeholder="AWD / FWD / RWD"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Fuel Type</label>
-                <input
-                  type="text"
-                  value={fuelType}
-                  onChange={(e) => setFuelType(e.target.value)}
-                  placeholder="Gasoline / Hybrid / Electric"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Odometer / Mileage</label>
-                <input
-                  type="text"
-                  value={mileage}
-                  onChange={(e) => setMileage(e.target.value)}
-                  placeholder="45,200 mi (Actual)"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Exterior Color</label>
-                <input
-                  type="text"
-                  value={color}
-                  onChange={(e) => setColor(e.target.value)}
-                  placeholder="Black"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Title / Sale Doc</label>
-                <input
-                  type="text"
-                  value={titleStatus}
-                  onChange={(e) => setTitleStatus(e.target.value)}
-                  placeholder="Clean Title / Salvage Certificate"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Keys Status</label>
-                <input
-                  type="text"
-                  value={keys}
-                  onChange={(e) => setKeys(e.target.value)}
-                  placeholder="Yes / Present"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Primary Damage</label>
-                <input
-                  type="text"
-                  value={primaryDamage}
-                  onChange={(e) => setPrimaryDamage(e.target.value)}
-                  placeholder="Front End / Minor Dent"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Secondary Damage</label>
-                <input
-                  type="text"
-                  value={secondaryDamage}
-                  onChange={(e) => setSecondaryDamage(e.target.value)}
-                  placeholder="None / Rear Bumper"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Lot Number</label>
-                <input
-                  type="text"
-                  value={lotNumber}
-                  onChange={(e) => setLotNumber(e.target.value)}
-                  placeholder="e.g. 58492014"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-1">Sale / Yard Location</label>
-                <input
-                  type="text"
-                  value={location}
-                  onChange={(e) => setLocation(e.target.value)}
-                  placeholder="e.g. Savannah, GA"
-                  className="w-full px-3.5 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-                />
-              </div>
-            </div>
 
-            {/* Smart Auction Paste Decoder */}
-            <div className="pt-2">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
-                <label className="block text-xs font-bold uppercase text-slate-500">
-                  Condition &amp; History Notes (Paste Raw Auction Text)
-                </label>
-                <button
-                  type="button"
-                  onClick={handleSmartFormatNotes}
-                  className="inline-flex items-center gap-1.5 text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg transition shadow-sm"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Decode &amp; Format Raw Text</span>
-                </button>
-              </div>
-              <textarea
-                rows={5}
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                placeholder="Paste raw auction condition text here (Copart, IAAI, Manheim, etc.) and click 'Decode & Format Raw Text'..."
-                className="w-full px-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-600 outline-none"
-              />
-              {reportDetails.length > 0 && (
-                <p className="text-xs text-emerald-700 font-semibold mt-1">
-                  ✓ {reportDetails.length} structured attributes extracted for the report table.
-                </p>
-              )}
-            </div>
-
-            {/* Existing Photos (When Editing) */}
-            {existingPhotos.length > 0 && (
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-500 mb-2">
-                  Current Saved Photos ({existingPhotos.length})
-                </label>
-                <div className="flex flex-wrap gap-3">
-                  {existingPhotos.map((url, idx) => (
-                    <div
-                      key={idx}
-                      className="relative w-20 h-16 rounded-lg overflow-hidden border border-slate-300"
-                    >
-                      <img src={url} alt={`Saved ${idx + 1}`} className="w-full h-full object-cover" />
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveExistingPhoto(idx)}
-                        title="Remove Photo"
-                        className="absolute top-1 right-1 bg-red-600 text-white p-0.5 rounded-full opacity-90 hover:opacity-100"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
+              <div className="space-y-4 pt-6 border-t border-slate-200">
+                {['auction', 'shipment', 'container'].map(cat => (
+                  <div key={cat} className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                    <div className="flex justify-between items-center mb-3">
+                      <h4 className="font-bold capitalize text-slate-700">{cat} Photos</h4>
+                      <label className="cursor-pointer bg-slate-800 text-white px-3 py-1.5 rounded-lg text-sm font-bold hover:bg-slate-700 transition-colors">
+                        Add Photos
+                        <input type="file" multiple accept="image/*" className="hidden" onChange={(e) => handleFileUpload(e, cat)} disabled={!formData.vin} />
+                      </label>
                     </div>
-                  ))}
-                </div>
+                    <div className="flex gap-2 overflow-x-auto pb-2">
+                      {formData.photos?.[cat]?.map((url, i) => (
+                        <div key={i} className="relative w-24 h-24 flex-shrink-0 rounded-lg overflow-hidden border border-slate-300 group">
+                          <img src={url} alt="" className="w-full h-full object-cover" />
+                          <button type="button" onClick={() => { const n = [...formData.photos[cat]]; n.splice(i,1); setFormData({...formData, photos: {...formData.photos, [cat]: n}}); }} className="absolute top-1 right-1 bg-red-500/90 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"><X size={12} /></button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
-            )}
 
-            {/* Upload Photos */}
-            <div>
-              <label className="block text-xs font-bold uppercase text-slate-500 mb-1">
-                {editingVin ? 'Add More Photos' : 'Vehicle Photos'}
-              </label>
-              <div className="border-2 border-dashed border-slate-300 rounded-xl p-4 text-center hover:border-blue-500 transition">
-                <Upload className="w-6 h-6 text-slate-400 mx-auto mb-1" />
-                <input
-                  id="photo-input"
-                  type="file"
-                  multiple
-                  accept="image/*"
-                  onChange={(e) => e.target.files && setNewPhotos(Array.from(e.target.files))}
-                  className="text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                />
-                {newPhotos.length > 0 && (
-                  <p className="text-xs text-blue-600 mt-2 font-medium">
-                    {newPhotos.length} new file(s) ready to upload
-                  </p>
-                )}
+              <div className="flex justify-end space-x-3 pt-6 border-t border-slate-200">
+                <button type="button" onClick={() => setEditingVin(null)} className="px-6 py-2.5 text-slate-600 font-bold hover:bg-slate-100 rounded-xl">Cancel</button>
+                <button type="submit" className="px-6 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 shadow-md">Save Vehicle</button>
               </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={uploading}
-              className={`w-full font-bold py-3.5 rounded-xl transition shadow-sm text-white ${
-                editingVin
-                  ? 'bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300'
-                  : 'bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300'
-              }`}
-            >
-              {uploading
-                ? 'Uploading Photos & Saving...'
-                : editingVin
-                ? 'Update Vehicle Report'
-                : 'Publish Vehicle Page'}
-            </button>
-          </form>
-        </div>
-
-        {/* Right Column: Searchable Inventory List */}
-        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-          <h2 className="text-xl font-bold text-slate-900 mb-3">
-            Published Vehicles ({vehicles.length})
-          </h2>
-
-          <div className="relative mb-4">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={searchFilter}
-              onChange={(e) => setSearchFilter(e.target.value)}
-              placeholder="Filter by VIN, make, model..."
-              className="w-full pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-600 outline-none"
-            />
+            </form>
           </div>
-
-          {filteredVehicles.length === 0 ? (
-            <p className="text-sm text-slate-500 text-center py-8">No matching vehicles found.</p>
-          ) : (
-            <div className="space-y-3 max-h-[760px] overflow-y-auto pr-1">
-              {filteredVehicles.map((v) => (
-                <div
-                  key={v.id}
-                  className={`p-3 border rounded-xl flex items-center justify-between gap-2 transition ${
-                    editingVin === v.vin
-                      ? 'border-amber-500 bg-amber-50/60'
-                      : 'border-slate-200 hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="overflow-hidden">
-                    <a
-                      href={`/vin/${v.vin}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="font-mono text-sm font-bold text-blue-600 hover:underline inline-flex items-center gap-1 truncate"
-                    >
-                      <span>{v.vin}</span>
-                      <ExternalLink className="w-3 h-3 shrink-0" />
-                    </a>
-                    <p className="text-xs font-semibold text-slate-700 truncate">
-                      {v.year} {v.make} {v.model}
-                    </p>
-                    <p className="text-[11px] text-slate-400 mt-0.5">
-                      {v.photos?.length || 0} photo(s)
-                      {v.primaryDamage ? ` • ${v.primaryDamage}` : ''}
-                    </p>
-                  </div>
-
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => handleStartEdit(v)}
-                      title="Edit Vehicle"
-                      className="p-2 text-slate-500 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition"
-                    >
-                      <Pencil className="w-4 h-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteVehicle(v.id)}
-                      title="Delete Vehicle"
-                      className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
-      </div>
-    </main>
+      ) : (
+        <div className="flex-grow p-4 sm:p-8 bg-slate-100">
+          <div className="max-w-6xl mx-auto space-y-6">
+            <div className="flex justify-between items-center bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+              <h1 className="text-2xl font-extrabold text-slate-800">Inventory Database</h1>
+              <button onClick={handleNew} className="flex items-center bg-slate-900 text-white px-5 py-2.5 rounded-xl font-bold shadow-md hover:bg-slate-800 transition-colors">
+                <Plus className="h-5 w-5 mr-2" /> Add Vehicle
+              </button>
+            </div>
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 text-xs uppercase tracking-wider">
+                      <th className="px-6 py-4 font-bold">VIN</th>
+                      <th className="px-6 py-4 font-bold">Vehicle</th>
+                      <th className="px-6 py-4 font-bold text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {vehicles.map(v => (
+                      <tr key={v.vin} className="hover:bg-slate-50">
+                        <td className="px-6 py-4 font-mono font-bold text-slate-800">{v.vin}</td>
+                        <td className="px-6 py-4 font-medium text-slate-600">{v.year} {v.make} {v.model}</td>
+                        <td className="px-6 py-4 flex justify-end space-x-4">
+                          <button onClick={() => handleEdit(v)} className="text-blue-600 hover:text-blue-800 font-bold text-sm">Edit</button>
+                          <button onClick={() => handleDelete(v.vin)} className="text-red-500 hover:text-red-700 font-bold text-sm">Delete</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
