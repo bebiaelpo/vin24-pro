@@ -21,19 +21,39 @@ export async function generateMetadata({ params }) {
   const vehicle = await getVehicleData(vin);
 
   if (!vehicle) {
-    return { title: `VIN ${vin} - Not Found | vin24.pro` };
+    return { 
+      title: `VIN ${vin} - Not Found | vin24.pro`,
+      robots: { index: false, follow: false }
+    };
   }
 
-  const titleText = `VIN ${vehicle.vin} - ${vehicle.year} ${vehicle.make} ${vehicle.model} - Clean Title`;
+  const titleStatus = vehicle.titleStatus || 'Clean Title';
+  const titleText = `VIN ${vehicle.vin} - ${vehicle.year} ${vehicle.make} ${vehicle.model} - ${titleStatus}`;
   const descText = `History for VIN ${vehicle.vin}. View high-resolution photos, exact mileage, and definitive proof of a clean title. Not sold on Copart or IAAI.`;
+
+  // Prevent Base64 strings from breaking social media embeds
+  const firstPhoto = vehicle.photos?.auction?.[0];
+  const isValidImageUrl = firstPhoto && firstPhoto.startsWith('http');
 
   return {
     title: titleText,
     description: descText,
+    robots: {
+      index: true,
+      follow: true,
+    },
     openGraph: {
       title: titleText,
       description: descText,
-      images: vehicle.photos?.auction?.[0] ? [vehicle.photos.auction[0]] : [],
+      url: `https://www.vin24.pro/vin/${vehicle.vin}`,
+      images: isValidImageUrl ? [
+        {
+          url: firstPhoto,
+          width: 1200,
+          height: 630,
+          alt: `${vehicle.year} ${vehicle.make} ${vehicle.model}`,
+        }
+      ] : [],
     },
   };
 }
@@ -43,12 +63,17 @@ export default async function VinPage({ params }) {
   const vin = decodeURIComponent(resolvedParams.id).trim().toUpperCase();
   const vehicle = await getVehicleData(vin);
 
-// SEO Schema Generation for Google
+  // Prevent Base64 strings from breaking Google Search Console Schema
+  const firstPhoto = vehicle?.photos?.auction?.[0];
+  const isValidImageUrl = firstPhoto && firstPhoto.startsWith('http');
+  const schemaImageUrl = isValidImageUrl ? firstPhoto : "https://www.vin24.pro/favicon.ico";
+
+  // SEO Schema Generation for Google
   const jsonLd = vehicle ? {
     "@context": "https://schema.org", 
     "@type": "Vehicle",
     "name": `${vehicle.year} ${vehicle.make} ${vehicle.model}`,
-    "image": vehicle.photos?.auction?.[0] || "",
+    "image": schemaImageUrl,
     "description": `Verified condition report and history for VIN ${vehicle.vin}`,
     "vehicleIdentificationNumber": vehicle.vin,
     "knownVehicleDamages": "None - Clean History",
