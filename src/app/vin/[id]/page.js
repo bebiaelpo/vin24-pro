@@ -43,17 +43,28 @@ export default async function VinPage({ params }) {
   const vin = decodeURIComponent(resolvedParams.id).trim().toUpperCase();
   const vehicle = await getVehicleData(vin);
 
-  // SEO Schema Generation for Google
+// SEO Schema Generation for Google
   const jsonLd = vehicle ? {
     "@context": "https://schema.org", 
     "@type": "Vehicle",
+    "name": `${vehicle.year} ${vehicle.make} ${vehicle.model}`,
+    "image": vehicle.photos?.auction?.[0] || "",
+    "description": `Verified condition report and history for VIN ${vehicle.vin}`,
     "vehicleIdentificationNumber": vehicle.vin,
     "knownVehicleDamages": "None - Clean History",
     "mileageFromOdometer": { "@type": "QuantitativeValue", "value": vehicle.mileage, "unitCode": "SMI" },
     "productionDate": vehicle.year, 
     "model": vehicle.model,
     "brand": { "@type": "Brand", "name": vehicle.make },
-    "itemCondition": "https://schema.org/UsedCondition"
+    "itemCondition": "https://schema.org/UsedCondition",
+    "offers": {
+      "@type": "Offer",
+      "url": `https://www.vin24.pro/vin/${vehicle.vin}`,
+      "priceCurrency": "USD",
+      "price": "0",
+      "itemCondition": "https://schema.org/UsedCondition",
+      "availability": "https://schema.org/OutOfStock"
+    }
   } : null;
 
   return (
